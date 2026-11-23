@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useEffect, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { PERIOD_LABELS, type PeriodKey } from "../lib/metrics";
 
 export function Card({ title, subtitle, right, children, className = "" }: {
@@ -122,6 +122,11 @@ export function Chip({ active, onClick, children, color }: { active: boolean; on
 }
 
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", esc);
+    return () => document.removeEventListener("keydown", esc);
+  }, [onClose]);
   return (
     <div className="fixed inset-0 z-[1000] grid place-items-center bg-black/40 p-4 backdrop-blur-[2px]" onMouseDown={onClose}>
       <div role="dialog" aria-modal="true" aria-label={title} className="card w-full max-w-md p-6" onMouseDown={(e) => e.stopPropagation()}>

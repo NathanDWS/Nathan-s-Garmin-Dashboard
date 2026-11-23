@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import AddAccountDialog from "./components/AddAccountDialog";
 import EmptyState from "./components/EmptyState";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Nav from "./components/Nav";
 import ProfileSwitcher from "./components/ProfileSwitcher";
 import SyncBadge from "./components/SyncBadge";
@@ -86,11 +87,13 @@ export default function App() {
           )}
           {error && <p className="card mb-6 p-4 text-sm text-bad">Kon data niet laden: {error}</p>}
           {active && data && (
-            <Suspense fallback={<div className="py-20 text-center text-sm text-muted">Laden…</div>}>
-              {hasAnyData(data) || route === "/coach" || route === "/doelen"
-                ? <Page route={route} props={{ data, profile: active, now: dataNow(data), go, period, setPeriod }} />
-                : <EmptyState syncing={syncing} />}
-            </Suspense>
+            <ErrorBoundary key={route}>
+              <Suspense fallback={<div className="py-20 text-center text-sm text-muted">Laden…</div>}>
+                {hasAnyData(data) || route === "/coach" || route === "/doelen"
+                  ? <Page route={route} props={{ data, profile: active, now: dataNow(data), go, period, setPeriod }} />
+                  : <EmptyState syncing={syncing} />}
+              </Suspense>
+            </ErrorBoundary>
           )}
         </main>
       </div>

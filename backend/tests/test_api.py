@@ -214,4 +214,5 @@ def test_spa_fallback(paths, tmp_path):
     c = TestClient(app)
     assert "app" in c.get("/").text
     assert "app" in c.get("/trainingen").text
+    assert c.get("/").headers["cache-control"] == "no-cache"
     assert c.get("/api/nope").status_code == 404

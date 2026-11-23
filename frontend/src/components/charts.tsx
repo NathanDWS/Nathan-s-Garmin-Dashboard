@@ -50,8 +50,10 @@ function Frame({ height, children }: { height: number; children: ReactNode }) {
 }
 
 /** Daily values as faint dots + a 7-day average line. Optional reference (goal / baseline). */
-export function TrendChart({ data, x = "date", value, avg, height = 200, reference, domain, xFormat = shortDate }: {
+export function TrendChart({ data, x = "date", value, avg, height = 200, reference, domain, xFormat = shortDate, pair = false }: {
   data: Row[]; x?: string; value: Series; avg?: Series; height?: number; reference?: { y: number; label: string };
+  /** pair=true: value and avg are two separate measures, both drawn as solid lines. */
+  pair?: boolean;
   domain?: [number | "auto" | "dataMin" | "dataMax", number | "auto" | "dataMin" | "dataMax"]; xFormat?: (v: string) => string;
 }) {
   const series = avg ? [value, avg] : [value];
@@ -62,11 +64,11 @@ export function TrendChart({ data, x = "date", value, avg, height = 200, referen
         <ComposedChart data={data} margin={{ top: 6, right: 8, bottom: 0, left: 0 }}>
           {grid}
           <XAxis dataKey={x} {...axis} tickFormatter={xFormat} minTickGap={28} />
-          <YAxis {...axis} width={38} domain={domain ?? ["auto", "auto"]} tickFormatter={(v) => fmt(v)} />
+          <YAxis {...axis} width={38} domain={domain ?? ["auto", "auto"]} tickFormatter={(v) => fmt(v, value.digits ? 1 : 0)} allowDecimals={!!value.digits} />
           <Tooltip content={<Tip series={series} xFormat={xFormat} />} cursor={{ stroke: "var(--faint)", strokeDasharray: "3 3" }} />
           {reference && <ReferenceLine y={reference.y} stroke="var(--faint)" strokeDasharray="4 4" label={{ value: reference.label, position: "insideTopRight", fill: "var(--muted)", fontSize: 11 }} />}
-          <Line dataKey={value.key} stroke={value.color} strokeOpacity={avg ? 0.35 : 1} strokeWidth={avg ? 1.5 : 2}
-            dot={avg ? { r: 2, fill: value.color, strokeWidth: 0, fillOpacity: 0.5 } : false} activeDot={{ r: 4, stroke: "var(--surface)", strokeWidth: 2 }}
+          <Line dataKey={value.key} stroke={value.color} strokeOpacity={avg && !pair ? 0.35 : 1} strokeWidth={avg && !pair ? 1.5 : 2}
+            dot={avg && !pair ? { r: 2, fill: value.color, strokeWidth: 0, fillOpacity: 0.5 } : false} activeDot={{ r: 4, stroke: "var(--surface)", strokeWidth: 2 }}
             isAnimationActive={false} connectNulls />
           {avg && <Line dataKey={avg.key} stroke={avg.color} strokeWidth={2} dot={false} activeDot={false} isAnimationActive={false} connectNulls strokeLinecap="round" />}
         </ComposedChart>
@@ -123,7 +125,7 @@ export function BarsChart({ data, x, series, height = 200, stacked = false, xFor
 }
 
 /** Single horizontal proportion bar (e.g. HR zones), each segment labelled below. */
-export function ProportionBar({ parts }: { parts: { label: string; value: number; color: string }[] }) {
+export function ProportionBar({ parts, legend = true }: { parts: { label: string; value: number; color: string }[]; legend?: boolean }) {
   const total = parts.reduce((s, p) => s + p.value, 0);
   if (!total) return <p className="text-sm text-muted">Geen gegevens.</p>;
   return (
@@ -133,14 +135,14 @@ export function ProportionBar({ parts }: { parts: { label: string; value: number
           <div key={p.label} title={`${p.label}: ${Math.round((p.value / total) * 100)}%`} style={{ width: `${(p.value / total) * 100}%`, background: p.color }} />
         ))}
       </div>
-      <div className="mt-3 grid grid-cols-5 gap-2 text-xs">
+      {legend && <div className="mt-3 grid grid-cols-5 gap-2 text-xs">
         {parts.map((p) => (
           <div key={p.label}>
             <div className="flex items-center gap-1.5 text-muted"><span className="h-2 w-2 rounded-full" style={{ background: p.color }} />{p.label}</div>
             <div className="mt-0.5 font-medium tabular-nums">{Math.round((p.value / total) * 100)}%</div>
           </div>
         ))}
-      </div>
+      </div>}
     </div>
   );
 }

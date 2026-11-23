@@ -78,3 +78,10 @@ def test_insights_demo_at_most_three(paths):
     for it in items:
         assert set(it) >= {"title", "detail", "severity"}
         assert it["severity"] in ("info", "let_op")
+
+
+def test_insight_detail_uses_dutch_date():
+    card = insights._card({"metric": "restingHeartRate", "date": "2026-11-22", "value": 58, "baseline_mean": 52,
+                           "baseline_std": 2, "z_score": 3, "direction": "above"})
+    assert "22 nov" in card["detail"] and "2026-11-22" not in card["detail"]
+    assert card["severity"] == "let_op"

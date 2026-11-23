@@ -63,11 +63,19 @@ export default function ActivityDetail({ data, profile, go, activityId }: PagePr
           </Card>
         )}
         <Card title="Hartslagzones" subtitle="Tijd per zone" className={track && track.length > 1 ? "" : "lg:col-span-3"}>
-          <ProportionBar parts={a.hr_zones.map((v, i) => ({ label: `Zone ${i + 1}`, value: v, color: ZONE_COLORS[i] }))} />
-          <ul className="mt-5 space-y-1.5 text-sm">
-            {a.hr_zones.map((v, i) => (
-              <li key={i} className="flex justify-between"><span className="text-muted">Zone {i + 1}</span><span className="tabular-nums">{duration(v)}</span></li>
-            ))}
+          <ProportionBar legend={false} parts={a.hr_zones.map((v, i) => ({ label: `Zone ${i + 1}`, value: v, color: ZONE_COLORS[i] }))} />
+          <ul className="mt-5 space-y-2 text-sm">
+            {a.hr_zones.map((v, i) => {
+              const total = a.hr_zones.reduce((s, x) => s + x, 0);
+              return (
+                <li key={i} className="flex items-center gap-2">
+                  <span className="h-2 w-2 rounded-full" style={{ background: ZONE_COLORS[i] }} />
+                  <span className="flex-1 text-muted">Zone {i + 1}</span>
+                  <span className="w-10 text-right tabular-nums text-muted">{total ? Math.round((v / total) * 100) : 0}%</span>
+                  <span className="w-14 text-right tabular-nums">{duration(v)}</span>
+                </li>
+              );
+            })}
           </ul>
         </Card>
       </div>

@@ -64,3 +64,12 @@ describe("AddAccountDialog", () => {
     expect(api.reconnect).toHaveBeenCalledWith("papa", { password: "geheim", remember_password: false });
   });
 });
+
+describe("Modal", () => {
+  it("closes on Escape", async () => {
+    const onClose = vi.fn();
+    render(<AddAccountDialog mode="add" onClose={onClose} onDone={() => {}} />);
+    await userEvent.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalled();
+  });
+});

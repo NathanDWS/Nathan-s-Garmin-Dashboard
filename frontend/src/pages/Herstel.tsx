@@ -72,7 +72,7 @@ export default function Herstel({ data, now }: PageProps) {
         )}
         {bp.length > 0 && (
           <Card title="Bloeddruk" subtitle="Metingen van de laatste 6 maanden">
-            <TrendChart data={bp} value={{ key: "systolic", label: "Bovendruk", color: "var(--c-series)", unit: "mmHg" }} avg={{ key: "diastolic", label: "Onderdruk", color: "var(--c-series-2)", unit: "mmHg" }} />
+            <TrendChart data={bp} value={{ key: "systolic", label: "Bovendruk", color: "var(--c-series)", unit: "mmHg" }} avg={{ key: "diastolic", label: "Onderdruk", color: "var(--c-series-2)", unit: "mmHg" }} pair />
           </Card>
         )}
       </div>

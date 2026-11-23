@@ -87,7 +87,7 @@ export default function Trainingen({ data, now, go, period, setPeriod }: PagePro
 
         {status.length > 1 && (
           <Card title="Trainingsbelasting" subtitle="Acuut (7 dagen) vs chronisch (28 dagen)" className={vo2.length > 1 && meta && paceRows.length > 1 ? "lg:col-span-2" : ""}>
-            <TrendChart data={status} value={{ key: "acute_load", label: "Acuut", color: "var(--c-series)" }} avg={{ key: "chronic_load", label: "Chronisch", color: "var(--c-series-2)" }} />
+            <TrendChart data={status} value={{ key: "acute_load", label: "Acuut", color: "var(--c-series)" }} avg={{ key: "chronic_load", label: "Chronisch", color: "var(--c-series-2)" }} pair />
           </Card>
         )}
 

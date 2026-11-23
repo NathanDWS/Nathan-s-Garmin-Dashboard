@@ -174,6 +174,6 @@ def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach
             candidate = (static_dir / rest).resolve()
             if rest and candidate.is_file() and static_dir.resolve() in candidate.parents:
                 return FileResponse(candidate)
-            return FileResponse(index)
+            return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     return app

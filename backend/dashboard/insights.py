@@ -35,6 +35,17 @@ def _fmt(metric: str, v: float) -> str:
     return f"{v:.0f}" if abs(v) >= 10 else f"{v:.1f}"
 
 
+MONTHS = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+
+
+def _day(iso: str) -> str:
+    try:
+        y, m, d = (int(x) for x in iso[:10].split("-"))
+        return f"{d} {MONTHS[m - 1]}"
+    except (ValueError, IndexError):
+        return iso
+
+
 def _card(f: dict[str, Any]) -> dict[str, Any] | None:
     meta = LABELS.get(f.get("metric", ""))
     if not meta:
@@ -46,7 +57,7 @@ def _card(f: dict[str, Any]) -> dict[str, Any] | None:
     unit_s = unit if unit in ("%", "/min") else (f" {unit}" if unit else "")
     return {
         "title": f"{label} {word} dan normaal",
-        "detail": f"{_fmt(f['metric'], f['value'])}{unit_s} op {f['date']}, je gemiddelde is "
+        "detail": f"{_fmt(f["metric"], f["value"])}{unit_s} op {_day(f["date"])}, je gemiddelde is "
                   f"{_fmt(f['metric'], f['baseline_mean'])}{unit_s}.",
         "severity": "info" if favourable or abs(f["z_score"]) < 2 else "let_op",
         "metric": f["metric"],
