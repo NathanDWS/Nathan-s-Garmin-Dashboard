@@ -17,7 +17,7 @@ from .config import Paths
 from .garmin_auth import LoginResult
 from .profiles import Profile, ProfileStore
 
-HTTP_BY_STATUS = {"bad_credentials": 400, "rate_limited": 429, "error": 502}
+HTTP_BY_STATUS = {"bad_code": 400, "bad_credentials": 400, "rate_limited": 429, "error": 502}
 
 
 class AddProfile(BaseModel):
@@ -49,6 +49,7 @@ class SessionIn(BaseModel):
 def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach: Any,
                static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="Garmin Dashboard", docs_url=None, redoc_url=None)
+    adding: set[str] = set()  # MFA login ids that belong to a profile created by "Account toevoegen"
 
     def profile_or_404(pid: str) -> Profile:
         try:
@@ -81,7 +82,9 @@ def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach
     def add_profile(body: AddProfile) -> JSONResponse:
         p = store.add(body.name, body.email)
         res = auth.start(p.id, body.email, body.password, body.remember_password)
-        if res.status not in ("ok", "needs_mfa"):
+        if res.status == "needs_mfa" and res.login_id:
+            adding.add(res.login_id)
+        elif res.status != "ok":
             store.remove(p.id)
         return login_response(res, p.id, created=True)
 
@@ -91,7 +94,12 @@ def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach
         res = auth.finish_mfa(body.login_id, body.code)
         if pid is None:
             return login_response(res, "", created=False)
-        return login_response(res, pid, created=True)
+        created = body.login_id in adding
+        if res.status != "bad_code":
+            adding.discard(body.login_id)
+            if res.status != "ok" and created:
+                store.remove(pid)
+        return login_response(res, pid, created=created)
 
     @app.post("/api/profiles/{pid}/reconnect")
     def reconnect(pid: str, body: Reconnect) -> JSONResponse:
@@ -104,7 +112,11 @@ def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach
         profile_or_404(pid)
         sync.forget(pid)
         coach.forget(pid)
-        store.remove(pid)
+        try:
+            store.remove(pid)
+        except OSError:
+            return JSONResponse({"error": "Niet alle bestanden konden worden verwijderd. Probeer het zo opnieuw."},
+                                status_code=409)
         return Response(status_code=204)
 
     @app.post("/api/profiles/{pid}/sync")
@@ -169,11 +181,15 @@ def create_app(paths: Paths, *, store: ProfileStore, auth: Any, sync: Any, coach
         if (static_dir / "assets").exists():
             app.mount("/assets", StaticFiles(directory=static_dir / "assets"), name="assets")
 
+        root = static_dir.resolve()
+        top_files = {f.name for f in root.iterdir() if f.is_file()}
+
         @app.get("/{rest:path}")
         def spa(rest: str) -> FileResponse:
-            candidate = (static_dir / rest).resolve()
-            if rest and candidate.is_file() and static_dir.resolve() in candidate.parents:
-                return FileResponse(candidate)
+            # Only top-level files of dist are served by name; never build a path from the URL,
+            # so "\\host\share" or "C:\..." can't make Windows open a network or local file.
+            if rest in top_files:
+                return FileResponse(root / rest)
             return FileResponse(index, headers={"Cache-Control": "no-cache"})
 
     return app

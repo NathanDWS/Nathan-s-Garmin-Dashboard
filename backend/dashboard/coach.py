@@ -59,7 +59,8 @@ class Coach:
         reply = agent.chat(message + DUTCH, history=history)
         if len(history) > MAX_HISTORY_MESSAGES:
             del history[: len(history) - MAX_HISTORY_MESSAGES]
-            while history and history[0].get("role") != "user":
+            # Start at a real user question: a tool_result (also role "user") without its tool_use is a 400.
+            while history and not (history[0].get("role") == "user" and isinstance(history[0].get("content"), str)):
                 history.pop(0)
         return reply
 

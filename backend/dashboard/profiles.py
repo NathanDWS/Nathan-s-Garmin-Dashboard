@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -13,6 +14,7 @@ from datetime import datetime
 from . import envfile
 from .config import Paths
 
+RESERVED_IDS = {"tokens", "demo"}  # data/tokens is the token root; demo is the sample profile
 PALETTE = ["#2563eb", "#e11d48", "#059669", "#d97706", "#7c3aed", "#0891b2"]
 
 
@@ -63,7 +65,7 @@ class ProfileStore:
     def add(self, name: str, email: str, color: str | None = None, pid: str | None = None) -> Profile:
         with self._lock:
             profiles = self._load()
-            taken = {p.id for p in profiles}
+            taken = {p.id for p in profiles} | (set() if pid else RESERVED_IDS)
             base = pid or slugify(name)
             new_id, n = base, 2
             while new_id in taken:
@@ -80,13 +82,31 @@ class ProfileStore:
             return profile
 
     def remove(self, pid: str) -> None:
+        """Delete files first, then the registry entry, so a failed delete can simply be retried.
+
+        Raises OSError if a file stays locked (e.g. a sync that has not exited yet)."""
+        for d in (self._paths.profile_dir(pid), self._paths.tokens(pid)):
+            _rmtree_retry(d)
+        envfile.remove_var(self._paths.env_file, self.password_var(pid))
         with self._lock:
             profiles = self._load()
             self._save([p for p in profiles if p.id != pid])
-        shutil.rmtree(self._paths.profile_dir(pid), ignore_errors=True)
-        shutil.rmtree(self._paths.tokens(pid), ignore_errors=True)
-        envfile.remove_var(self._paths.env_file, self.password_var(pid))
 
     @staticmethod
     def password_var(pid: str) -> str:
         return f"GARMIN_PASSWORD_{pid.upper()}"
+
+
+def _rmtree_retry(path, attempts: int = 5) -> None:
+    for i in range(attempts):
+        if not path.exists():
+            return
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.5)

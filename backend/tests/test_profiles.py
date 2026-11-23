@@ -48,3 +48,10 @@ def test_get_unknown_raises(paths):
 
     with pytest.raises(KeyError):
         ProfileStore(paths).get("nope")
+
+
+def test_reserved_ids_get_suffix(paths):
+    store = ProfileStore(paths)
+    assert store.add("Tokens", "t@x.nl").id == "tokens_2"
+    assert store.add("Demo", "d@x.nl").id == "demo_2"
+    assert store.add("Voorbeeld", "", pid="demo").id == "demo"

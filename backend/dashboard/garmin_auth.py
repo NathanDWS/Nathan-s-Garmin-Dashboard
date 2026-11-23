@@ -25,8 +25,9 @@ from .profiles import ProfileStore
 
 log = logging.getLogger(__name__)
 MFA_TTL_S = 600
+MFA_MAX_TRIES = 3
 
-Status = Literal["ok", "needs_mfa", "bad_credentials", "rate_limited", "error"]
+Status = Literal["ok", "needs_mfa", "bad_code", "bad_credentials", "rate_limited", "error"]
 
 
 @dataclass
@@ -45,6 +46,7 @@ class _Pending:
     password: str
     remember: bool
     expires: float
+    tries: int = 0
 
 
 class AuthService:
@@ -73,13 +75,24 @@ class AuthService:
     def finish_mfa(self, login_id: str, code: str) -> LoginResult:
         with self._lock:
             self._purge()
-            pending = self._pending.pop(login_id, None)
+            pending = self._pending.get(login_id)
+            if pending is not None:
+                pending.tries += 1
         if pending is None:
             return LoginResult("error", message="Deze inlogpoging is verlopen. Begin opnieuw.")
         try:
             pending.client.resume_login(pending.state, code.strip())
         except Exception as err:  # noqa: BLE001
-            return self._map_error(err)
+            res = self._map_error(err)
+            if res.status == "bad_credentials" and pending.tries < MFA_MAX_TRIES:
+                return LoginResult("bad_code", message="Code klopt niet. Controleer de code en probeer het opnieuw.")
+            with self._lock:
+                self._pending.pop(login_id, None)
+            if res.status == "bad_credentials":
+                return LoginResult("error", message="Te vaak een verkeerde code. Begin opnieuw.")
+            return res
+        with self._lock:
+            self._pending.pop(login_id, None)
         return self._success(pending.client, pending.pid, pending.email, pending.password, pending.remember)
 
     def pending_profile(self, login_id: str) -> str | None:

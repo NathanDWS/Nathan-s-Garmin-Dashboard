@@ -85,3 +85,30 @@ def test_insight_detail_uses_dutch_date():
                            "baseline_std": 2, "z_score": 3, "direction": "above"})
     assert "22 nov" in card["detail"] and "2026-11-22" not in card["detail"]
     assert card["severity"] == "let_op"
+
+
+class ToolAgent(FakeAgent):
+    """Each turn: user text, assistant tool_use, user tool_result, assistant text (like HealthAgent)."""
+
+    turns = 0
+
+    def chat(self, message, history=None):
+        history.append({"role": "user", "content": message})
+        ToolAgent.turns += 1
+        for _ in range((1, 2, 1, 1, 3)[ToolAgent.turns % 5]):  # irregular tool round trips per turn
+            history.append({"role": "assistant", "content": [{"type": "tool_use", "id": "t"}]})
+            history.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}]})
+        history.append({"role": "assistant", "content": "ok"})
+        return "ok"
+
+
+def test_trimmed_history_starts_with_a_real_user_message(paths, store, monkeypatch):
+    from dashboard.coach import MAX_HISTORY_MESSAGES
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    coach = Coach(paths, store, agent_factory=ToolAgent)
+    for i in range(MAX_HISTORY_MESSAGES):
+        coach.chat("a", "s1", f"vraag {i}")
+        h = coach._histories[("a", "s1")]
+        assert len(h) <= MAX_HISTORY_MESSAGES
+        assert h[0]["role"] == "user" and isinstance(h[0]["content"], str), h[0]

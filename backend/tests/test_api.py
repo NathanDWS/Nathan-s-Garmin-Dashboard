@@ -216,3 +216,66 @@ def test_spa_fallback(paths, tmp_path):
     assert "app" in c.get("/trainingen").text
     assert c.get("/").headers["cache-control"] == "no-cache"
     assert c.get("/api/nope").status_code == 404
+
+
+def test_spa_never_touches_unc_or_absolute_paths(paths, tmp_path, monkeypatch):
+    import pathlib
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>app</html>")
+    app = create_app(paths, store=ProfileStore(paths), auth=FakeAuth(), sync=FakeSync(), coach=FakeCoach(),
+                     static_dir=dist)
+    touched = []
+    real_resolve, real_is_file = pathlib.Path.resolve, pathlib.Path.is_file
+    monkeypatch.setattr(pathlib.Path, "resolve", lambda self, *a, **k: touched.append(str(self)) or real_resolve(self, *a, **k))
+    monkeypatch.setattr(pathlib.Path, "is_file", lambda self: touched.append(str(self)) or real_is_file(self))
+    c = TestClient(app)
+    for url in ("/%5C%5Cevil.example%5Cshare%5Cx", "/C:%5Cwindows%5Cwin.ini", "//evil.example/share/x"):
+        r = c.get(url)
+        assert r.status_code == 200 and "app" in r.text
+    assert not [t for t in touched if "evil" in t or "windows" in t.lower()]
+
+
+def test_delete_during_sync_reports_failure_and_keeps_profile(paths, monkeypatch):
+    client, store, *_ = make(paths)
+    store.add("Papa", "p@x.nl")
+    paths.db("papa").parent.mkdir(parents=True)
+    paths.db("papa").write_text("x")
+
+    def locked(*a, **k):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr("dashboard.profiles.shutil.rmtree", locked)
+    monkeypatch.setattr("dashboard.profiles.time.sleep", lambda s: None)
+    r = client.delete("/api/profiles/papa")
+    assert r.status_code == 409
+    assert [p.id for p in store.list()] == ["papa"]
+
+
+class MfaFailAuth(FakeAuth):
+    def __init__(self, outcome):
+        super().__init__("needs_mfa")
+        self.outcome = outcome
+
+    def finish_mfa(self, login_id, code):
+        if self.outcome == "bad_code":
+            return LoginResult("bad_code", message="Code klopt niet.")
+        self.pending.pop(login_id, None)
+        return LoginResult("error", message="x")
+
+
+def test_wrong_mfa_code_keeps_profile_for_retry(paths):
+    client, store, *_ = make(paths, auth=MfaFailAuth("bad_code"))
+    client.post("/api/profiles", json=add_body())
+    r = client.post("/api/profiles/mfa", json={"login_id": "L1", "code": "1"})
+    assert r.status_code == 400 and r.json()["status"] == "bad_code"
+    assert [p.id for p in store.list()] == ["papa"]
+
+
+def test_failed_mfa_in_add_mode_removes_profile(paths):
+    client, store, *_ = make(paths, auth=MfaFailAuth("error"))
+    client.post("/api/profiles", json=add_body())
+    r = client.post("/api/profiles/mfa", json={"login_id": "L1", "code": "1"})
+    assert r.status_code == 502
+    assert store.list() == []

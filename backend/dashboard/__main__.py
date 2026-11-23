@@ -30,7 +30,7 @@ def _lan_ip() -> str:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     paths = get_paths()
-    load_dotenv(paths.env_file)
+    load_dotenv(paths.env_file, interpolate=False)
     paths.data.mkdir(parents=True, exist_ok=True)
     store = ProfileStore(paths)
     if not store.list():

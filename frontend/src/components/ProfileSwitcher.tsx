@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { deleteProfile } from "../lib/api";
+import { ApiError, deleteProfile } from "../lib/api";
 import { useProfiles } from "../lib/profile-context";
 import type { Profile } from "../lib/types";
 import { Button, Modal } from "./ui";
@@ -27,6 +27,9 @@ export default function ProfileSwitcher({ onAdd }: { onAdd: () => void }) {
     try {
       await deleteProfile(p.id);
       await refresh();
+    } catch (e) {
+      const msg = e instanceof ApiError && e.body?.error;
+      window.alert(msg || "Verwijderen mislukt. Probeer het zo opnieuw.");
     } finally {
       setBusy(false);
       setConfirm(null);

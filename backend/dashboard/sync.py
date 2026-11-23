@@ -59,6 +59,10 @@ class SyncManager:
         proc = self._procs.get(pid)
         return proc is not None and proc.poll() is None
 
+    def _child_env(self) -> dict[str, str]:
+        return dict(os.environ) | {"DASHBOARD_ROOT": str(self._paths.root), "PYTHONUNBUFFERED": "1",
+                                   "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
     def start(self, pid: str, start: str | None = None) -> bool:
         with self._lock:
             self._store.get(pid)
@@ -70,7 +74,7 @@ class SyncManager:
             log_path = self._paths.log(pid)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(log_path, "w", encoding="utf-8")  # noqa: SIM115 - closed in poll()
-            env = os.environ | {"DASHBOARD_ROOT": str(self._paths.root), "PYTHONUNBUFFERED": "1"}
+            env = self._child_env()
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             try:
                 proc = self._launch(args, stdout=log, stderr=subprocess.STDOUT, env=env, creationflags=flags)
@@ -98,6 +102,8 @@ class SyncManager:
                 st = self._read(pid) | {"state": state, "finished_at": _now(), "message": None}
                 if state == "ok":
                     st["last_success"] = st["finished_at"]
+                elif code == 4:
+                    st["message"] = "Er loopt nog een eerdere sync voor dit profiel. Probeer het straks opnieuw."
                 elif state == "error":
                     st["message"] = f"Ophalen mislukt (code {code}). Zie data/{pid}/sync.log"
                 self._write(pid, st)
@@ -107,6 +113,10 @@ class SyncManager:
             proc = self._procs.pop(pid, None)
             if proc is not None and hasattr(proc, "terminate"):
                 proc.terminate()
+                try:
+                    proc.wait(timeout=10)  # release garmin.db before the profile folder is deleted
+                except Exception:  # noqa: BLE001 - deletion reports its own failure
+                    pass
             log = self._logs.pop(pid, None)
             if log:
                 log.close()

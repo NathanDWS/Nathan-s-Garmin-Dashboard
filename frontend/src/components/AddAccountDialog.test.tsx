@@ -41,6 +41,17 @@ describe("AddAccountDialog", () => {
     expect(onDone).toHaveBeenCalledWith("papa");
   });
 
+  it("wrong MFA code keeps the code field for another try", async () => {
+    vi.mocked(api.addProfile).mockResolvedValue({ status: "needs_mfa", login_id: "L1" });
+    vi.mocked(api.submitMfa).mockRejectedValueOnce(new api.ApiError(400, { status: "bad_code", message: "Code klopt niet. Controleer de code en probeer het opnieuw." }));
+    render(<AddAccountDialog mode="add" onClose={() => {}} onDone={() => {}} />);
+    await fill();
+    await userEvent.type(await screen.findByLabelText("Code uit je e-mail of sms"), "111111");
+    await userEvent.click(screen.getByRole("button", { name: "Bevestigen" }));
+    expect(await screen.findByText(/Code klopt niet/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Code uit je e-mail of sms")).toBeInTheDocument();
+  });
+
   it("shows bad credentials error", async () => {
     vi.mocked(api.addProfile).mockRejectedValue(new api.ApiError(400, { status: "bad_credentials" }));
     render(<AddAccountDialog mode="add" onClose={() => {}} onDone={() => {}} />);
