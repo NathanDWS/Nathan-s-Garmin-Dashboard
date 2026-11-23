@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import type { PageProps } from "../App";
 import { BarsChart, TrendChart } from "../components/charts";
-import { Card, PageHeader, Stat } from "../components/ui";
+import { Card, PageHeader, PeriodSlicer, Stat } from "../components/ui";
 import { getGoals } from "../lib/api";
-import { addDays, avgBy, fmt, iso, lastN, monthLabel, rolling, shortDate, sumBy, weekStart } from "../lib/metrics";
+import { addDays, avgBy, fmt, inWindow, iso, lastN, monthLabel, monthOptions, periods, rolling, shortDate, sumBy, weekStart } from "../lib/metrics";
 
-export default function Lichaam({ data, profile, now }: PageProps) {
+export default function Lichaam({ data, profile, now, period, setPeriod }: PageProps) {
+  const { current } = periods(now, period);
   const [stepGoal, setStepGoal] = useState(10000);
   useEffect(() => { getGoals(profile.id).then((g) => setStepGoal(g.stappen_per_dag)).catch(() => {}); }, [profile.id]);
 
-  const steps = useMemo(() => lastN(data.daily, 60, now).map((d) => ({ date: d.date, steps: d.steps })), [data, now]);
+  const steps = useMemo(() => inWindow(data.daily, current).map((d) => ({ date: d.date, steps: d.steps })), [data, current.start.getTime(), current.end.getTime()]);
 
   const months = useMemo(() => {
     const by = new Map<string, number[]>();
@@ -42,7 +43,7 @@ export default function Lichaam({ data, profile, now }: PageProps) {
 
   return (
     <div>
-      <PageHeader title="Lichaam" subtitle="Gewicht, stappen en beweging" />
+      <PageHeader title="Lichaam" subtitle="Gewicht, stappen en beweging" right={<PeriodSlicer value={period} onChange={setPeriod} months={monthOptions(data.daily.map((d) => d.date))} />} />
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="Stappen (gem. 7 d)" value={fmt(avgBy(week, (d) => d.steps))} hint={`doel ${fmt(stepGoal)}`} />
         <Stat label="Intensiteitsminuten deze week" value={fmt(weeks.at(-1)?.min ?? 0)} hint="doel 150 per week" tone={(weeks.at(-1)?.min ?? 0) >= 150 ? "good" : undefined} />
@@ -51,7 +52,7 @@ export default function Lichaam({ data, profile, now }: PageProps) {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <Card title="Stappen per dag" subtitle="Laatste 60 dagen" className="lg:col-span-2">
+        <Card title="Stappen per dag" subtitle={current.label} className="lg:col-span-2">
           <BarsChart data={steps} x="date" xFormat={shortDate} series={[{ key: "steps", label: "Stappen", color: "var(--c-series)" }]} reference={{ y: stepGoal, label: "doel" }} />
         </Card>
         <Card title="Gemiddelde stappen per maand">

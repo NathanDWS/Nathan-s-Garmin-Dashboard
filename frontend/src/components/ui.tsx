@@ -97,14 +97,30 @@ export function Segmented<T extends string>({ value, options, onChange, label }:
   );
 }
 
-export function PeriodSlicer({ value, onChange }: { value: PeriodKey; onChange: (p: PeriodKey) => void }) {
+export function PeriodSlicer({ value, onChange, months = [] }: {
+  value: PeriodKey; onChange: (p: PeriodKey) => void; months?: { value: PeriodKey; label: string }[];
+}) {
+  const chosen = value.startsWith("m:");
   return (
-    <Segmented
-      label="Periode"
-      value={value}
-      onChange={onChange}
-      options={(["month", "30d", "year"] as PeriodKey[]).map((k) => ({ value: k, label: PERIOD_LABELS[k] }))}
-    />
+    <div className="flex flex-wrap items-center gap-2">
+      <Segmented
+        label="Periode"
+        value={value}
+        onChange={onChange}
+        options={(["month", "30d", "year"] as const).map((k) => ({ value: k as PeriodKey, label: PERIOD_LABELS[k] }))}
+      />
+      {months.length > 0 && (
+        <select
+          aria-label="Kies maand"
+          value={chosen ? value : ""}
+          onChange={(e) => e.target.value && onChange(e.target.value as PeriodKey)}
+          className={`h-9 rounded-xl border bg-surface px-3 text-sm ${chosen ? "border-ink text-ink" : "border-line text-muted"}`}
+        >
+          <option value="">Kies maand…</option>
+          {months.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+        </select>
+      )}
+    </div>
   );
 }
 

@@ -1,10 +1,20 @@
 // Period maths and formatting shared by every page (period logic ported from garmin-claude-dashboard).
 import type { Sport } from "./types";
 
-export type PeriodKey = "month" | "30d" | "year";
+/** "m:YYYY-MM" = one chosen calendar month. */
+export type PeriodKey = "month" | "30d" | "year" | `m:${string}`;
 export type Window = { start: Date; end: Date; label: string };
 
-export const PERIOD_LABELS: Record<PeriodKey, string> = { month: "Deze maand", "30d": "30 dagen", year: "Dit jaar" };
+export const PERIOD_LABELS: Record<"month" | "30d" | "year", string> = { month: "Deze maand", "30d": "30 dagen", year: "Dit jaar" };
+
+const FULL_MONTHS = ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"];
+const monthName = (y: number, m: number) => `${FULL_MONTHS[m]} ${y}`;
+
+/** Months (newest first) that appear in the given ISO dates, for the "Kies maand" list. */
+export function monthOptions(dates: string[]): { value: PeriodKey; label: string }[] {
+  const keys = [...new Set(dates.map((d) => d.slice(0, 7)))].sort().reverse();
+  return keys.map((k) => ({ value: `m:${k}` as PeriodKey, label: monthName(Number(k.slice(0, 4)), Number(k.slice(5, 7)) - 1) }));
+}
 
 const MONTHS = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
 
@@ -14,6 +24,14 @@ const endOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate(
 
 export function periods(now: Date, key: PeriodKey): { current: Window; prev: Window } {
   const end = endOfDay(now);
+  if (key.startsWith("m:")) {
+    const y = Number(key.slice(2, 6)), m = Number(key.slice(7, 9)) - 1;
+    const monthEnd = new Date(y, m + 1, 0, 23, 59, 59);
+    return {
+      current: { start: new Date(y, m, 1), end: monthEnd < end ? monthEnd : end, label: monthName(y, m) },
+      prev: { start: new Date(y, m - 1, 1), end: new Date(y, m, 0, 23, 59, 59), label: monthName(new Date(y, m - 1, 1).getFullYear(), (m + 11) % 12) },
+    };
+  }
   if (key === "30d") {
     return {
       current: { start: startOfDay(addDays(end, -29)), end, label: "Laatste 30 dagen" },

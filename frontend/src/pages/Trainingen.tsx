@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { PageProps } from "../App";
 import { BarsChart, TrendChart } from "../components/charts";
 import { Card, Chip, Delta, PageHeader, PeriodSlicer, Stat } from "../components/ui";
-import { SPORT_META, SPORT_ORDER, duration, inWindow, km, monthLabel, pctChange, periods, rolling, shortDate, sumBy } from "../lib/metrics";
+import { SPORT_META, SPORT_ORDER, duration, inWindow, km, monthLabel, monthOptions, pctChange, periods, rolling, shortDate, sumBy } from "../lib/metrics";
 import type { Sport } from "../lib/types";
 import { ActivityRow } from "./Vandaag";
 
@@ -50,7 +50,7 @@ export default function Trainingen({ data, now, go, period, setPeriod }: PagePro
 
   return (
     <div>
-      <PageHeader title="Trainingen" subtitle={`${current.label} · vergeleken met ${prev.label.toLowerCase()}`} right={<PeriodSlicer value={period} onChange={setPeriod} />} />
+      <PageHeader title="Trainingen" subtitle={`${current.label} · vergeleken met ${prev.label.toLowerCase()}`} right={<PeriodSlicer value={period} onChange={setPeriod} months={monthOptions(data.activities.map((a) => a.date))} />} />
 
       <div className="mb-5 flex flex-wrap gap-2">
         <Chip active={sport === "alles"} onClick={() => setSport("alles")}>Alles</Chip>

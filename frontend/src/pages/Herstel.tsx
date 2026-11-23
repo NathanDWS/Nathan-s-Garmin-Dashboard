@@ -1,15 +1,14 @@
 import { useMemo } from "react";
 import type { PageProps } from "../App";
 import { RangeChart, TrendChart } from "../components/charts";
-import { Card, PageHeader, Stat } from "../components/ui";
-import { avgBy, fmt, lastN, rolling } from "../lib/metrics";
+import { Card, PageHeader, PeriodSlicer, Stat } from "../components/ui";
+import { avgBy, fmt, inWindow, lastN, monthOptions, periods, rolling } from "../lib/metrics";
 
-const DAYS = 60;
-
-export default function Herstel({ data, now }: PageProps) {
+export default function Herstel({ data, now, period, setPeriod }: PageProps) {
+  const { current } = periods(now, period);
   const rows = useMemo(() => {
-    const daily = lastN(data.daily, DAYS, now);
-    const sleepBy = new Map(lastN(data.sleep, DAYS, now).map((s) => [s.date, s]));
+    const daily = inWindow(data.daily, current);
+    const sleepBy = new Map(inWindow(data.sleep, current).map((s) => [s.date, s]));
     const dates = [...new Set([...daily.map((d) => d.date), ...sleepBy.keys()])].sort();
     const dailyBy = new Map(daily.map((d) => [d.date, d]));
     const base = dates.map((date) => {
@@ -23,8 +22,9 @@ export default function Herstel({ data, now }: PageProps) {
     const withAvg = (k: keyof (typeof base)[number]) => rolling(base.map((r) => r[k] as number | null), 7);
     const avg = Object.fromEntries((["rhr", "hrv", "stress", "resp", "spo2"] as const).map((k) => [k, withAvg(k)]));
     return base.map((r, i) => ({ ...r, rhr7: avg.rhr[i], hrv7: avg.hrv[i], stress7: avg.stress[i], resp7: avg.resp[i], spo27: avg.spo2[i] }));
-  }, [data, now]);
+  }, [data, current.start.getTime(), current.end.getTime()]);
 
+  const months = monthOptions(data.daily.map((d) => d.date));
   const bp = lastN(data.blood_pressure, 180, now);
   const has = (k: "spo2" | "resp" | "hrv" | "stress") => rows.some((r) => r[k] != null);
   const last7 = rows.slice(-7), prev = rows.slice(0, -7);
@@ -33,7 +33,7 @@ export default function Herstel({ data, now }: PageProps) {
 
   return (
     <div>
-      <PageHeader title="Herstel" subtitle={`Laatste ${DAYS} dagen · lijn = 7-dagen gemiddelde`} />
+      <PageHeader title="Herstel" subtitle={`${current.label} · lijn = 7-dagen gemiddelde`} right={<PeriodSlicer value={period} onChange={setPeriod} months={months} />} />
       <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="Rusthartslag (7 d)" value={fmt(rhr.now)} unit="bpm" hint={rhr.base ? `gemiddeld ${fmt(rhr.base)} daarvoor` : undefined}
           tone={rhr.now && rhr.base ? (rhr.now - rhr.base > 3 ? "warn" : "good") : undefined} />

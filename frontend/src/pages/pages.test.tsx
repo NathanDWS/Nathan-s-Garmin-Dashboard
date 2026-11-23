@@ -7,6 +7,7 @@ import Vandaag from "./Vandaag";
 import Doelen from "./Doelen";
 import Coach from "./Coach";
 import Herstel from "./Herstel";
+import Slaap from "./Slaap";
 
 vi.mock("../lib/api", async (orig) => {
   const mod: any = await orig();
@@ -91,5 +92,20 @@ describe("Herstel", () => {
     render(<Herstel {...props()} />);
     expect(screen.getByText("Rusthartslag")).toBeInTheDocument();
     expect(screen.queryByText("Bloeddruk")).toBeNull();
+  });
+});
+
+describe("month filter", () => {
+  it("Slaap shows only the chosen month", () => {
+    render(<Slaap {...props()} period={"m:2026-10" as any} />);
+    expect(screen.getAllByText("oktober 2026").filter((e) => e.tagName !== "OPTION")).toHaveLength(1);
+    expect(screen.getByLabelText("Kies maand")).toHaveValue("m:2026-10");
+  });
+
+  it("choosing a month in the list sets the period", async () => {
+    const p = props();
+    render(<Slaap {...p} />);
+    await userEvent.selectOptions(screen.getByLabelText("Kies maand"), "m:2026-10");
+    expect(p.setPeriod).toHaveBeenCalledWith("m:2026-10");
   });
 });

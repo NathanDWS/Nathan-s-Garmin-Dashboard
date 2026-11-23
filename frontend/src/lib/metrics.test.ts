@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inWindow, pace, periods, rolling, sumBy, weekStart } from "./metrics";
+import { inWindow, iso, monthOptions, pace, periods, rolling, sumBy, weekStart } from "./metrics";
 
 describe("periods", () => {
   const now = new Date(2026, 10, 23); // 23 nov 2026
@@ -49,5 +49,23 @@ describe("helpers", () => {
     expect(weekStart(new Date(2026, 10, 23)).getDay()).toBe(1);
     expect(weekStart(new Date(2026, 10, 23)).getDate()).toBe(23);
     expect(weekStart(new Date(2026, 10, 22)).getDate()).toBe(16);
+  });
+});
+
+describe("month filter", () => {
+  const now = new Date(2026, 10, 23, 12);
+  it("a chosen past month is the whole month, compared with the month before", () => {
+    const { current, prev } = periods(now, "m:2026-09");
+    expect([iso(current.start), iso(current.end), current.label]).toEqual(["2026-09-01", "2026-09-30", "september 2026"]);
+    expect([iso(prev.start), iso(prev.end), prev.label]).toEqual(["2026-08-01", "2026-08-31", "augustus 2026"]);
+  });
+  it("the current month stops at today", () => {
+    expect(iso(periods(now, "m:2026-11").current.end)).toBe("2026-11-23");
+  });
+  it("lists months that have data, newest first", () => {
+    expect(monthOptions(["2026-09-03", "2026-11-01", "2026-09-10"])).toEqual([
+      { value: "m:2026-11", label: "november 2026" },
+      { value: "m:2026-09", label: "september 2026" },
+    ]);
   });
 });
