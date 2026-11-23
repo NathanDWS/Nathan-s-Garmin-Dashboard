@@ -1,0 +1,620 @@
+"""Proactive insight scanner — detects anomalies and patterns automatically.
+
+This runs locally in Python (no LLM cost for detection). The LLM is only
+invoked to interpret and explain the flagged findings.
+
+Findings carry evidence-tier metadata so the agent can match its output
+language to the strength of the underlying rule, and a multi-cause composite
+finding is emitted when several recovery markers deviate together — so the
+agent ranks plausible contributors instead of naming a single cause.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Any
+
+from garmin_insights.db.memory import MemoryStore
+from garmin_insights.knowledge.medical import INSIGHT_RULES, get_behavior_rules
+from garmin_insights.stats_utils import benjamini_hochberg
+from garmin_insights.tools.analysis_tools import AnalysisEngine, AnomalyResult, ComparisonResult
+
+# Thresholds above which environmental factors warrant inclusion as ranked
+# confounders. These are deliberately conservative — they err on the side
+# of NOT crowding the contributors list with mild weather days.
+_ENV_HEAT_APPARENT_C    = 28.0   # apparent max — physiological-load threshold
+_ENV_AQI_EUROPEAN       = 60.0   # >60 = "poor" on EU scale
+_ENV_PM25_UG_M3         = 25.0   # WHO 24-hour guideline
+_ENV_POLLEN_GRAINS_M3   = 50.0   # generic "high" threshold for grass/ragweed
+
+logger = logging.getLogger(__name__)
+
+
+# Metrics whose simultaneous deviation should collapse into a single composite
+# "illness-like recovery strain pattern" finding rather than three separate ones.
+# The sign is the strain-indicating direction of the z-score: RHR and respiration
+# above baseline (+1) indicate strain, HRV below baseline (-1) does. A deviation
+# the opposite way (e.g. anomalously LOW resting HR on a great recovery day) is
+# the same magnitude but the opposite of strain and must not trigger the finding.
+_STRAIN_DIRECTIONS = {
+    "restingHeartRate": 1,
+    "avgOvernightHrv": -1,
+    "averageRespirationValue": 1,
+}
+
+# The direction (sign of the z-score) in which a deviation is a CONCERN for
+# each baselined metric. Used to gate rule-metadata attachment on single-metric
+# anomalies: the KB rules describe the bad direction (low body-battery floor,
+# high stress, low sleep score), so stamping their tier onto a deviation the
+# GOOD way (e.g. battery floor unusually high, SpO2 unusually high) invites the
+# model to narrate an improvement as a tier-B concern. Metrics not listed here
+# keep unconditional attachment.
+_CONCERN_DIRECTIONS = {
+    "restingHeartRate": 1,
+    "avgOvernightHrv": -1,
+    "averageRespirationValue": 1,
+    "stressPercentage": 1,
+    "highStressPercentage": 1,
+    "avgSleepStress": 1,
+    "awakeCount": 1,
+    "sleepScore": -1,
+    "deepSleepSeconds": -1,
+    "remSleepSeconds": -1,
+    "bodyBatteryHighestValue": -1,
+    "bodyBatteryLowestValue": -1,
+    "bodyBatteryAtWakeTime": -1,
+    "bodyBatteryChange": -1,
+    "averageSpo2": -1,
+    "totalSteps": -1,
+}
+
+# Overnight-physiology deviations map onto their own KB rules. The metrics
+# come from insights/overnight.py (the per-sample sleep_intraday series), not
+# from the daily cache, so they can't go through the trigger_metric lookup the
+# other passes use.
+_OVERNIGHT_RULES = {
+    "hr_dip_pct":             "blunted_nocturnal_hr_fall",
+    "hr_nadir_pct_of_night":  "delayed_overnight_hr_nadir",
+    "desat_index_per_hour":   "overnight_desaturation_burden",
+    "spo2_pct_below_90":      "overnight_desaturation_burden",
+    "hrv_trend_pct":          "overnight_hrv_trajectory",
+    "waso_minutes":           "sleep_fragmentation_waso",
+    "fragmentation_index":    "sleep_fragmentation_waso",
+}
+
+# The screening labels the overnight summary can raise, and the rule whose
+# tier and confounders should govern how the agent phrases each one.
+_OVERNIGHT_SCREENING_RULES = {
+    "blunted_overnight_hr_fall":        "blunted_nocturnal_hr_fall",
+    "recurrent_overnight_desaturation": "overnight_desaturation_burden",
+}
+
+# Baseline window for the overnight pass. Long enough for a robust per-metric
+# median, short enough that a seasonal shift doesn't become the baseline.
+OVERNIGHT_WINDOW_DAYS = 30
+
+
+# Window (days) over which scan_behavior_impacts compares on- vs off-days.
+# Exposed as a constant so the portable prompt can state the true window when
+# it embeds these findings alongside a shorter data snapshot.
+BEHAVIOR_IMPACT_WINDOW_DAYS = 30
+
+
+def _is_female(biological_sex: str | None) -> bool:
+    """Mirror the cycle-rule gate used in get_rules_summary_for_llm."""
+    return (biological_sex or "").strip().lower().startswith("f")
+
+
+def _visible_confounders(confounders, biological_sex: str | None) -> list[str]:
+    """Drop cycle-only confounders for non-female users.
+
+    Mirrors the logic in ``get_rules_summary_for_llm``: ``luteal_phase`` is
+    physiologically meaningless for male users, so it must never surface in
+    scanner output (composite ranked contributors or single-rule findings).
+    """
+    cs = list(confounders or [])
+    if not _is_female(biological_sex):
+        cs = [c for c in cs if c != "luteal_phase"]
+    return cs
+
+
+def _attach_rule_metadata(finding: dict[str, Any], rule, biological_sex: str | None = None) -> None:
+    """Stamp tier + confounder fields onto a finding so the agent can decide
+    how strongly to phrase its reply. For non-female users ``luteal_phase`` is
+    stripped from the emitted confounder list (cycle physiology can't apply)."""
+    finding["medical_context"] = rule.research_summary
+    finding["citation"] = rule.research_citation
+    finding["evidence_tier"] = rule.evidence_tier
+    finding["claim_strength"] = rule.claim_strength
+    finding["measurement_confidence"] = rule.measurement_confidence
+    confounders = _visible_confounders(rule.confounders, biological_sex)
+    if confounders:
+        finding["confounders"] = confounders
+    if rule.requires_user_context:
+        finding["requires_user_context"] = True
+
+
+class InsightScanner:
+    """Scans cached data for anomalies and behavior correlations."""
+
+    def __init__(
+        self,
+        memory: MemoryStore,
+        analysis: AnalysisEngine,
+        biological_sex: str | None = None,
+    ) -> None:
+        self._memory = memory
+        self._analysis = analysis
+        # Used to strip cycle-only confounders (luteal_phase) from emitted
+        # findings for non-female users — same gate the LLM summary applies.
+        self._biological_sex = biological_sex
+
+    def scan_anomalies(self) -> list[dict[str, Any]]:
+        """Detect metric anomalies relative to baselines."""
+        anomalies = self._analysis.run_full_anomaly_scan()
+        findings = []
+        for a in anomalies:
+            finding = a.to_dict()
+            concern = _CONCERN_DIRECTIONS.get(a.metric)
+            if concern is not None and a.z_score * concern < 0:
+                # Deviation the GOOD way — still report it, but don't stamp a
+                # strain-rule's evidence tier onto an improvement.
+                finding["favourable_direction"] = True
+                findings.append(finding)
+                continue
+            matching_rules = [
+                r for r in INSIGHT_RULES
+                if r.trigger_metric == a.metric and r.trigger_behavior is None
+            ]
+            if matching_rules:
+                _attach_rule_metadata(finding, matching_rules[0], self._biological_sex)
+            findings.append(finding)
+        return findings
+
+    def scan_composite_strain(self) -> list[dict[str, Any]]:
+        """When two or three of RHR / HRV / respiration deviate together,
+        emit a single multi-cause composite finding with ranked plausible
+        contributors. This replaces three parallel single-cause anomalies
+        with one tier-aware "illness-like recovery strain pattern" entry.
+
+        Only strain-direction deviations count (RHR up, HRV down, respiration
+        up) — a day where RHR is anomalously low and HRV anomalously high
+        deviates on two triad metrics but is an unusually GOOD recovery day,
+        not a strain pattern."""
+        anomalies = self._analysis.run_full_anomaly_scan()
+        by_metric = {
+            a.metric: a for a in anomalies
+            if a.z_score * _STRAIN_DIRECTIONS.get(a.metric, 0) > 0
+        }
+        if len(by_metric) < 2:
+            return []
+
+        composite_rule = next(
+            (r for r in INSIGHT_RULES if r.name == "multi_cause_recovery_strain"),
+            None,
+        )
+        if composite_rule is None:
+            return []
+
+        # Rank plausible contributors: user-logged behaviours in the last 48h
+        # outrank generic confounders, because the user has positive evidence.
+        # Environmental extremes (heat / poor AQ / high pollen) sit between
+        # logged behaviours and generic confounders — they're positive evidence
+        # from Open-Meteo but not user-confirmed, so they outrank generic
+        # confounders but are subordinate to logged behaviours.
+        ranked: list[str] = []
+        recent_behaviors = self._recent_logged_behaviors(hours=48)
+        for behavior in recent_behaviors:
+            ranked.append(f"logged: {behavior}")
+        for env_factor in self._recent_environmental_extremes(days=2):
+            ranked.append(f"environment: {env_factor}")
+        # Append generic confounders from the rule, dedup against ranked list.
+        # luteal_phase is stripped here for non-female users so a male persona
+        # never sees cycle physiology ranked as a possible contributor.
+        for c in _visible_confounders(composite_rule.confounders, self._biological_sex):
+            if not any(c in r for r in ranked):
+                ranked.append(c)
+
+        finding: dict[str, Any] = {
+            "rule_name": composite_rule.name,
+            "deviating_metrics": list(by_metric.keys()),
+            "z_scores": {m: a.z_score for m, a in by_metric.items()},
+            "ranked_contributors": ranked,
+        }
+        _attach_rule_metadata(finding, composite_rule, self._biological_sex)
+        # Annotate sparse-baseline guard so the agent can prepend the
+        # "low-confidence" prefix when warranted.
+        baseline_days = self._available_baseline_days()
+        if baseline_days is not None and baseline_days < 21:
+            finding["baseline_days_available"] = baseline_days
+            finding["baseline_low_confidence"] = True
+        return [finding]
+
+    def _recent_logged_behaviors(self, hours: int = 48) -> list[str]:
+        """Return distinct lifestyle-journal labels logged in the last `hours`.
+        Returns [] silently on any error — this is a best-effort enrichment."""
+        try:
+            df = self._memory.recent_lifestyle_entries(hours=hours)  # type: ignore[attr-defined]
+        except AttributeError:
+            return []
+        except Exception as e:
+            logger.debug("recent lifestyle entries unavailable: %s", e)
+            return []
+        try:
+            return sorted({str(v) for v in df["behavior"].dropna().tolist()})
+        except Exception:
+            return []
+
+    def _recent_environmental_extremes(self, days: int = 2) -> list[str]:
+        """Return descriptive labels for environmental confounders that exceed
+        the configured thresholds in the most recent N days.
+
+        Pulls from the optional `environment_daily` table written by the
+        Open-Meteo pipeline. Returns [] silently when no env data is available,
+        so this is a no-op for users who haven't configured HOME_LAT/HOME_LON.
+        """
+        import sqlite3
+        try:
+            db_path = self._memory.db_path
+        except AttributeError:
+            return []
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows: list[tuple] = []
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            try:
+                cur = conn.execute(
+                    "SELECT apparent_temp_max_c, european_aqi, pm25, "
+                    "pollen_grass, pollen_birch, pollen_ragweed "
+                    "FROM environment_daily "
+                    "WHERE date >= ? AND date <= ?",
+                    (start, end),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            # Table doesn't exist for this DB yet — first run before fetcher
+            # has populated environment_daily.
+            return []
+        except Exception as exc:
+            logger.debug("environment lookup failed: %s", exc)
+            return []
+        if not rows:
+            return []
+
+        def _peak(idx: int) -> float | None:
+            vals = [r[idx] for r in rows if r[idx] is not None]
+            return max(vals) if vals else None
+
+        labels: list[str] = []
+        peak_apparent = _peak(0)
+        if peak_apparent is not None and peak_apparent >= _ENV_HEAT_APPARENT_C:
+            labels.append(f"heat (apparent {peak_apparent:.1f}°C)")
+        peak_aqi = _peak(1)
+        if peak_aqi is not None and peak_aqi >= _ENV_AQI_EUROPEAN:
+            labels.append(f"poor air quality (EU AQI {peak_aqi:.0f})")
+        peak_pm25 = _peak(2)
+        if peak_pm25 is not None and peak_pm25 >= _ENV_PM25_UG_M3:
+            labels.append(f"high PM2.5 ({peak_pm25:.1f} µg/m³)")
+        pollen_peak = max(
+            [v for v in (_peak(3), _peak(4), _peak(5)) if v is not None] or [0.0]
+        )
+        if pollen_peak >= _ENV_POLLEN_GRAINS_M3:
+            labels.append(f"high pollen ({pollen_peak:.0f} grains/m³)")
+        return labels
+
+    def _available_baseline_days(self) -> int | None:
+        """Best-effort count of consecutive days of baseline data available.
+        Returns None if the analysis engine doesn't expose this."""
+        try:
+            return int(self._analysis.baseline_days_available())  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        except Exception as e:
+            logger.debug("baseline_days_available not available: %s", e)
+            return None
+
+    def scan_behavior_impacts(
+        self, days: int = BEHAVIOR_IMPACT_WINDOW_DAYS
+    ) -> list[dict[str, Any]]:
+        """Analyze the impact of all logged lifestyle behaviors on key metrics.
+
+        Significance is decided with a Benjamini-Hochberg FDR correction across
+        the whole behavior battery, not a per-test ``p<0.05``. With ~20 rules
+        each Welch-tested independently, an uncorrected threshold surfaces ~1
+        false-positive "significant" behavior per scan — the same multiple-
+        comparisons trap that ``compute_correlation_matrix`` already guards
+        against. The per-test ``p_value`` is preserved; only the ``significant``
+        flag (which gates insight persistence) becomes FDR-aware.
+        """
+        behavior_rules = get_behavior_rules()
+
+        # First pass: compute every comparison so BH can see the full set of
+        # p-values before deciding which clear the corrected threshold.
+        candidates: list[tuple[Any, ComparisonResult, dict[str, Any]]] = []
+        seen_comparisons: set[tuple] = set()
+        for rule in behavior_rules:
+            # Skip if we've already reported this recently
+            if self._memory.is_insight_suppressed(rule.name):
+                logger.debug("Skipping suppressed insight: %s", rule.name)
+                continue
+
+            result = self._analysis.compare_metric_with_behavior(
+                behavior=rule.trigger_behavior,
+                metric=rule.trigger_metric,
+                days=days,
+            )
+
+            if result is None or result.n_with < 2 or result.n_without < 2:
+                continue
+
+            # Two rules whose trigger behaviours fuzzy-match the same logged
+            # behaviour (e.g. "Travel" and "Traveling/Vacation") produce the
+            # identical comparison twice — duplicate findings that also pad the
+            # BH correction family. Keep the first rule's row only.
+            comparison_key = (
+                rule.trigger_metric, result.n_with, result.n_without,
+                result.mean_with, result.mean_without,
+            )
+            if comparison_key in seen_comparisons:
+                logger.debug("Skipping duplicate comparison for rule %s", rule.name)
+                continue
+            seen_comparisons.add(comparison_key)
+
+            finding = result.to_dict()
+            finding["rule_name"] = rule.name
+            _attach_rule_metadata(finding, rule, self._biological_sex)
+            candidates.append((rule, result, finding))
+
+        # BH correction across the battery. None p-values (n too small for a
+        # t-test) are treated as not-significant by benjamini_hochberg.
+        flags = benjamini_hochberg([r.p_value for _, r, _ in candidates])
+
+        findings = []
+        for (rule, result, finding), significant in zip(candidates, flags):
+            finding["significant"] = significant
+            finding["significant_correction"] = "benjamini_hochberg_q0.05"
+
+            if significant:
+                # Noteworthy — save this insight to prevent duplicate reporting
+                try:
+                    description = rule.description_template.format(**finding)
+                except (KeyError, ValueError):
+                    description = (
+                        f"{rule.trigger_behavior} → {rule.trigger_metric}: "
+                        f"{result.mean_with:.1f} vs {result.mean_without:.1f} "
+                        f"(p={result.p_value:.3f})"
+                    )
+
+                self._memory.save_insight(
+                    rule_name=rule.name,
+                    description=description,
+                    significance=result.p_value,
+                    data=finding,
+                )
+                finding["description"] = description
+
+            findings.append(finding)
+
+        return findings
+
+    def scan_overnight(self, days: int = OVERNIGHT_WINDOW_DAYS) -> list[dict[str, Any]]:
+        """Deviations in the SHAPE of the most recent night, plus any screening
+        labels over the recent run of nights.
+
+        The other passes read the daily cache, which carries a night's averages
+        and extremes. This one reads the per-sample overnight series, so it can
+        surface what those hide: a heart-rate fall that was unusually small or
+        arrived unusually late, an HRV trajectory running the wrong way, a
+        night of repeated SpO2 dips behind one unremarkable minimum, or wake
+        time that duration alone doesn't show.
+
+        Returns [] silently for a database with no overnight series — which is
+        every night before the fetcher gained its SleepIntraday handler.
+        """
+        try:
+            db_path = self._memory.db_path
+        except AttributeError:
+            return []
+        try:
+            from garmin_insights.insights.overnight import OvernightService
+
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            summary = OvernightService(db_path).summary(start, end)
+        except Exception as exc:
+            logger.debug("overnight scan unavailable: %s", exc)
+            return []
+        if not summary.get("available"):
+            return []
+
+        rules_by_name = {r.name: r for r in INSIGHT_RULES}
+        findings: list[dict[str, Any]] = []
+
+        for dev in summary.get("deviations") or []:
+            finding: dict[str, Any] = {"source": "overnight_physiology", **dev}
+            rule = rules_by_name.get(_OVERNIGHT_RULES.get(dev.get("metric", ""), ""))
+            if rule is not None:
+                finding["rule_name"] = rule.name
+                _attach_rule_metadata(finding, rule, self._biological_sex)
+            findings.append(finding)
+
+        for sig in summary.get("screening") or []:
+            finding = {"source": "overnight_screening", **sig}
+            rule = rules_by_name.get(
+                _OVERNIGHT_SCREENING_RULES.get(sig.get("signal", ""), "")
+            )
+            if rule is not None:
+                finding["rule_name"] = rule.name
+                _attach_rule_metadata(finding, rule, self._biological_sex)
+            findings.append(finding)
+
+        # The baseline guard the other passes get for free: too few nights and
+        # a "deviation" is mostly the sparse baseline talking.
+        nights_available = len(summary.get("nights") or [])
+        if findings and nights_available < 21:
+            for f in findings:
+                f["nights_available"] = nights_available
+                f["baseline_low_confidence"] = True
+        return findings
+
+    def scan_trends(self) -> list[dict[str, Any]]:
+        """Detect notable trends in key metrics."""
+        trend_metrics = [
+            "restingHeartRate", "avgOvernightHrv", "sleepScore",
+            "stressPercentage", "bodyBatteryHighestValue",
+            "totalSteps", "deepSleepSeconds",
+        ]
+
+        findings = []
+        for metric in trend_metrics:
+            result = self._analysis.detect_trend(metric, days=14)
+            if result is None:
+                continue
+            if result.direction != "stable" and result.r_squared > 0.3:
+                finding = result.to_dict()
+                # Find matching medical rules
+                matching = [
+                    r for r in INSIGHT_RULES
+                    if r.trigger_metric == metric and r.trigger_behavior is None
+                ]
+                if matching:
+                    _attach_rule_metadata(finding, matching[0], self._biological_sex)
+                findings.append(finding)
+
+        return findings
+
+    def _recent_activities(self, days: int) -> list[dict[str, Any]]:
+        """activity_summary rows for the last ``days`` days ([] if unavailable)."""
+        import sqlite3
+
+        db_path = getattr(self._memory, "db_path", None)
+        if not db_path:
+            return []
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            try:
+                rows = conn.execute(
+                    "SELECT time, activity_type, elapsed_duration FROM activity_summary "
+                    "WHERE time >= ? AND COALESCE(activity_type, '') != 'No Activity' "
+                    "AND COALESCE(activity_name, '') != 'END'",
+                    (start,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.debug("activity_summary unavailable: %s", exc)
+            return []
+        return [
+            {"time": t, "activity_type": at, "elapsed_duration": d} for t, at, d in rows
+        ]
+
+    def _recent_step_samples(self, days: int) -> list[tuple[str, float]]:
+        """steps_intraday (time, steps) for the last ``days`` days ([] if absent)."""
+        import sqlite3
+
+        db_path = getattr(self._memory, "db_path", None)
+        if not db_path:
+            return []
+        # Widen a day so the earliest local day isn't cut by the UTC offset.
+        start = (datetime.now() - timedelta(days=days + 1)).strftime("%Y-%m-%dT00:00:00")
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            try:
+                return conn.execute(
+                    "SELECT time, steps_count FROM steps_intraday "
+                    "WHERE time >= ? AND steps_count IS NOT NULL ORDER BY time",
+                    (start,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.debug("steps_intraday unavailable: %s", exc)
+            return []
+
+    def scan_fitness_guidelines(self) -> list[dict[str, Any]]:
+        """Activity dose + training guidance vs current evidence.
+
+        Steps vs the ~7k knee, weekly MVPA volume and its distribution, a
+        vigorous-burst suggestion when volume is short, recorded strength
+        volume, and HRV-guided intensity. See insights/fitness.py.
+        """
+        from garmin_insights.insights import fitness
+
+        get_range = getattr(self._memory, "get_daily_summaries_range", None)
+        if get_range is None:
+            return []
+        today = datetime.now().date()
+        try:
+            summaries = get_range(
+                (today - timedelta(days=90)).isoformat(), today.isoformat()
+            )
+        except Exception as exc:
+            logger.debug("fitness scan: summaries unavailable: %s", exc)
+            return []
+
+        yesterday = (today - timedelta(days=1)).isoformat()
+        complete = [
+            s for s in summaries
+            if s.get("date", "") <= yesterday and s.get("is_complete", True)
+        ]
+        last_28 = [s for s in complete if s["date"] >= (today - timedelta(days=28)).isoformat()]
+        last_7 = [s for s in complete if s["date"] >= (today - timedelta(days=7)).isoformat()]
+
+        rules = {r.name: r for r in INSIGHT_RULES}
+        findings: list[dict[str, Any]] = []
+
+        def _emit(rule_name: str, kind: str, payload: dict[str, Any] | None) -> None:
+            if not payload:
+                return
+            finding = {"source": "fitness_guidelines", "kind": kind,
+                       "rule_name": rule_name, **payload}
+            rule = rules.get(rule_name)
+            if rule is not None:
+                _attach_rule_metadata(finding, rule, self._biological_sex)
+            findings.append(finding)
+
+        _emit("daily_steps_dose_response", "steps", fitness.steps_dose(last_28))
+
+        mvpa = fitness.weekly_mvpa(last_7)
+        if mvpa:
+            below = mvpa["pattern"] == "below_guideline"
+            _emit("who_exercise_guidelines" if below else "weekend_warrior_mvpa",
+                  "weekly_mvpa", mvpa)
+            if below:
+                _emit("vigorous_intermittent_activity", "vigorous_bursts", {
+                    "days": mvpa["days"],
+                    "vigorous_days": mvpa["vigorous_days"],
+                    "vigorous_per_day": mvpa["vigorous_per_day"],
+                })
+
+        _emit("muscle_strengthening_weekly", "strength",
+              fitness.strength_volume(self._recent_activities(28), today))
+        _emit("hrv_guided_training", "hrv_readiness",
+              fitness.hrv_readiness(
+                  [x for x in summaries if x.get("date", "") >= (today - timedelta(days=60)).isoformat()],
+                  today,
+              ))
+
+        per_day = fitness.best_30min_cadence(self._recent_step_samples(28)) or {}
+        window_start = (today - timedelta(days=28)).isoformat()
+        per_day = {d: v for d, v in per_day.items() if window_start <= d <= yesterday}
+        _emit("walking_cadence_intensity", "cadence", fitness.cadence_summary(per_day))
+
+        _emit("rhr_fitness_trend", "rhr_trend", fitness.rhr_trend(complete, today))
+        return findings
+
+    def run_full_scan(self) -> dict[str, list[dict[str, Any]]]:
+        """Run all detection passes and return categorized findings."""
+        return {
+            "anomalies": self.scan_anomalies(),
+            "composite_strain": self.scan_composite_strain(),
+            "overnight": self.scan_overnight(),
+            "behavior_impacts": self.scan_behavior_impacts(),
+            "trends": self.scan_trends(),
+            "fitness": self.scan_fitness_guidelines(),
+        }

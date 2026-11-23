@@ -1,0 +1,1068 @@
+"""SQLite-backed persistence for baselines, insights, sessions, and user profile."""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Any
+
+from garmin_insights.config import Settings
+
+logger = logging.getLogger(__name__)
+
+# SQLite Schema
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    date TEXT PRIMARY KEY,
+    metric_json TEXT NOT NULL,
+    lifestyle_json TEXT,
+    computed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS baselines (
+    metric_name TEXT PRIMARY KEY,
+    avg_7d REAL,
+    avg_30d REAL,
+    std_7d REAL,
+    std_30d REAL,
+    min_30d REAL,
+    max_30d REAL,
+    latest_value REAL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS insights (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    significance REAL,
+    data_json TEXT,
+    discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rule ON insights (rule_name);
+CREATE INDEX IF NOT EXISTS idx_discovered ON insights (discovered_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary TEXT NOT NULL,
+    key_findings TEXT,
+    messages_json TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_profile (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS chat_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT,
+    event_date TEXT,
+    tags_json TEXT,
+    user_text TEXT,
+    assistant_text TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chat_memory_user_created ON chat_memory (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS daily_notes (
+    date TEXT PRIMARY KEY,
+    note TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS scan_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    focus TEXT NOT NULL,
+    report TEXT NOT NULL,
+    start_date TEXT,
+    end_date TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_scan_reports_created ON scan_reports (created_at);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    hypothesis TEXT NOT NULL,
+    behavior TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    expected_direction TEXT NOT NULL DEFAULT 'increase',
+    lag_days INTEGER NOT NULL DEFAULT 1,
+    min_days_per_arm INTEGER NOT NULL DEFAULT 5,
+    status TEXT NOT NULL DEFAULT 'active',
+    verdict TEXT,
+    result_json TEXT,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments (status);
+
+CREATE TABLE IF NOT EXISTS scale_readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    taken_at TEXT NOT NULL UNIQUE,
+    date TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    weight_kg REAL NOT NULL,
+    impedance_ohm REAL,
+    bmi REAL, body_fat_pct REAL, body_water_pct REAL,
+    muscle_mass_kg REAL, bone_mass_kg REAL, visceral_fat REAL,
+    metabolic_age REAL, physique_rating REAL,
+    extras_json TEXT,
+    raw_frames TEXT,
+    uploaded_to_garmin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_scale_readings_date ON scale_readings (date);
+"""
+
+class MemoryStore:
+    """SQLite-backed context and memory persistence."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.db_path = settings.sqlite_db_path
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row  # Access columns by name
+        return conn
+
+    def close(self) -> None:
+        pass  # Connections are per-call; nothing to close
+
+    def initialise_schema(self) -> None:
+        """Create tables if they don't exist."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.executescript(_SCHEMA_SQL)
+            conn.commit()
+            logger.info("SQLite schema initialised.")
+        except Exception as e:
+            logger.error(f"Failed to initialise schema: {e}")
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Daily Summaries
+    # ------------------------------------------------------------------
+    _UPSERT_SUMMARY_SQL = """
+        INSERT INTO daily_summaries (date, metric_json, lifestyle_json, computed_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(date) DO UPDATE SET
+            metric_json = excluded.metric_json,
+            lifestyle_json = excluded.lifestyle_json,
+            computed_at = datetime('now')
+    """
+
+    def upsert_daily_summaries(
+        self, rows: list[tuple[str, dict[str, Any], dict[str, Any] | None]]
+    ) -> None:
+        """Upsert many (date, metrics, lifestyle) rows in one transaction."""
+        if not rows:
+            return
+        params = [
+            (d, json.dumps(m), json.dumps(lj) if lj else None) for d, m, lj in rows
+        ]
+        conn = self._get_conn()
+        try:
+            conn.executemany(self._UPSERT_SUMMARY_SQL, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def upsert_daily_summary(
+        self,
+        date: str,
+        metrics: dict[str, Any],
+        lifestyle: dict[str, Any] | None = None,
+    ) -> None:
+        self.upsert_daily_summaries([(date, metrics, lifestyle)])
+
+    def get_daily_summary(self, date: str) -> dict[str, Any] | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT metric_json, lifestyle_json FROM daily_summaries WHERE date = ?",
+                (date,),
+            )
+            row = cursor.fetchone()
+            if row:
+                result = json.loads(row["metric_json"]) if row["metric_json"] else {}
+                if row["lifestyle_json"]:
+                    result["lifestyle"] = json.loads(row["lifestyle_json"])
+            else:
+                result = None
+        finally:
+            conn.close()
+        if result is not None:
+            note = self.get_daily_note(date)
+            if note:
+                result["note"] = note
+        return result
+
+    def get_daily_summaries_range(
+        self, start: str, end: str
+    ) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT date, metric_json, lifestyle_json FROM daily_summaries "
+                "WHERE date >= ? AND date <= ? ORDER BY date",
+                (start, end),
+            )
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                entry = {"date": row["date"]}
+                entry.update(json.loads(row["metric_json"]) if row["metric_json"] else {})
+                if row["lifestyle_json"]:
+                    entry["lifestyle"] = json.loads(row["lifestyle_json"])
+                results.append(entry)
+        finally:
+            conn.close()
+
+        # Merge in the user's free-text daily notes so they ride along with the
+        # metrics everywhere summaries are consumed (dashboard, the AI's
+        # get_daily_metrics tool, and the portable prompt). Notes live in a
+        # separate table so they survive daily_summaries cache rebuilds.
+        notes = self.get_daily_notes_range(start, end)
+        if notes:
+            for entry in results:
+                note = notes.get(entry["date"])
+                if note:
+                    entry["note"] = note
+        return results
+
+    def get_uncached_dates(self, start: str, end: str) -> list[str]:
+        """Return dates in range that don't have a valid cached daily summary.
+
+        A summary is considered valid only if it contains at least one real
+        metric beyond the base keys (date, is_complete). Empty summaries written
+        by a broken cache build are treated as uncached so they get rebuilt.
+        """
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            # A real summary has at least one metric from daily_stats or sleep_summary.
+            # Check for restingHeartRate or sleepScore as proxies for a valid entry.
+            cursor.execute(
+                """
+                SELECT date FROM daily_summaries
+                WHERE date >= ? AND date <= ?
+                  AND (
+                    json_extract(metric_json, '$.restingHeartRate') IS NOT NULL
+                    OR json_extract(metric_json, '$.sleepScore') IS NOT NULL
+                    OR json_extract(metric_json, '$.totalSteps') IS NOT NULL
+                    -- A day with genuinely no data (watch off, before the
+                    -- first sync) builds an empty summary. Without this, every
+                    -- dashboard load / 60 s refresh rebuilt each such day
+                    -- (~8 queries + a write apiece). Retry them hourly instead.
+                    OR computed_at >= datetime('now', '-1 hour')
+                  )
+                """,
+                (start, end),
+            )
+            cached = {row["date"] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+        d_start = datetime.strptime(start, "%Y-%m-%d").date()
+        d_end = datetime.strptime(end, "%Y-%m-%d").date()
+        all_dates = []
+        d = d_start
+        while d <= d_end:
+            ds = d.isoformat()
+            if ds not in cached:
+                all_dates.append(ds)
+            d += timedelta(days=1)
+        return all_dates
+
+    # ------------------------------------------------------------------
+    # Daily notes (user-authored free text about a given day)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_note_date(date: str) -> str:
+        """Zero-pad and validate a note date; raises ValueError on junk.
+
+        daily_notes is keyed by the literal string — strptime tolerates
+        unpadded inputs like '2026-7-1', which would otherwise become a junk
+        primary key invisible to every zero-padded range comparison (the AI's
+        save_daily_note tool passes dates through with no other validation).
+        """
+        return datetime.strptime(str(date).strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+
+    def upsert_daily_note(self, date: str, note: str) -> None:
+        """Save (or replace) the free-text note for a calendar day.
+
+        An empty/whitespace-only note deletes the row so blank days don't
+        clutter the AI's context.
+        """
+        date = self._normalize_note_date(date)
+        if note is None or not note.strip():
+            self.delete_daily_note(date)
+            return
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO daily_notes (date, note, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(date) DO UPDATE SET
+                    note = excluded.note,
+                    updated_at = datetime('now')
+                """,
+                (date, note.strip()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def append_daily_note(self, date: str, note: str) -> None:
+        """Append text to a day's note without discarding what's already there.
+
+        Used by the AI agent so it can never overwrite or erase a note the user
+        wrote by hand — it only ever adds to it. If the day has no note yet this
+        behaves like a plain insert. Identical content is not appended twice.
+        """
+        if note is None or not note.strip():
+            return
+        date = self._normalize_note_date(date)
+        addition = note.strip()
+        existing = self.get_daily_note(date)
+        if not existing:
+            self.upsert_daily_note(date, addition)
+            return
+        # Don't duplicate text that's already present in the note.
+        if addition in existing:
+            return
+        merged = f"{existing.rstrip()}\n{addition}"
+        self.upsert_daily_note(date, merged)
+
+    def delete_daily_note(self, date: str) -> None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM daily_notes WHERE date = ?", (date,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_daily_note(self, date: str) -> str | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT note FROM daily_notes WHERE date = ?", (date,))
+            row = cursor.fetchone()
+            return row["note"] if row else None
+        finally:
+            conn.close()
+
+    def get_daily_notes_range(self, start: str, end: str) -> dict[str, str]:
+        """Return {date: note} for all days in the inclusive range that have one."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT date, note FROM daily_notes "
+                "WHERE date >= ? AND date <= ? ORDER BY date",
+                (start, end),
+            )
+            return {row["date"]: row["note"] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def recent_lifestyle_entries(self, hours: int = 48):
+        """Lifestyle-journal entries logged within the last ``hours``.
+
+        Returns a DataFrame with ``date`` / ``behavior`` / ``status`` / ``value``
+        columns (empty when the table is absent — it is written by the fetcher,
+        so an insights-only database won't have it).
+
+        ``InsightScanner._recent_logged_behaviors`` uses this to rank the
+        contributors of a composite strain finding: behaviours the user logged
+        themselves are positive evidence and outrank generic confounders.
+
+        ``lifestyle_journal`` is keyed by calendar date with no time component,
+        so the window is rounded up to whole days — 48h means today and the two
+        preceding days, which is what "the last 48 hours" means for a
+        day-granularity log.
+        """
+        import pandas as pd
+
+        days = max(1, -(-int(hours) // 24))
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT date, behavior, status, value FROM lifestyle_journal "
+                "WHERE date >= ? AND date <= ? AND status = 1 ORDER BY date",
+                (start, end),
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            # Table not created yet — the fetcher owns it.
+            return pd.DataFrame(columns=["date", "behavior", "status", "value"])
+        finally:
+            conn.close()
+        if not rows:
+            return pd.DataFrame(columns=["date", "behavior", "status", "value"])
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # Baselines
+    # ------------------------------------------------------------------
+    _UPSERT_BASELINE_SQL = """
+        INSERT INTO baselines (metric_name, avg_7d, avg_30d, std_7d, std_30d,
+                               min_30d, max_30d, latest_value, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(metric_name) DO UPDATE SET
+            avg_7d = excluded.avg_7d, avg_30d = excluded.avg_30d,
+            std_7d = excluded.std_7d, std_30d = excluded.std_30d,
+            min_30d = excluded.min_30d, max_30d = excluded.max_30d,
+            latest_value = excluded.latest_value,
+            updated_at = datetime('now')
+    """
+
+    def upsert_baselines(self, rows: list[tuple]) -> None:
+        """Upsert many baselines in ONE transaction.
+
+        Each row is (metric, avg_7d, avg_30d, std_7d, std_30d, min_30d,
+        max_30d, latest). The cache refresh writes ~21 metrics every 60 s
+        while a dashboard is open; one commit instead of 21 cuts fsyncs and
+        write-lock windows the concurrent fetcher has to wait out.
+        """
+        if not rows:
+            return
+        conn = self._get_conn()
+        try:
+            conn.executemany(self._UPSERT_BASELINE_SQL, rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def upsert_baseline(
+        self, metric: str, avg_7d: float | None, avg_30d: float | None,
+        std_7d: float | None, std_30d: float | None,
+        min_30d: float | None, max_30d: float | None,
+        latest: float | None,
+    ) -> None:
+        self.upsert_baselines(
+            [(metric, avg_7d, avg_30d, std_7d, std_30d, min_30d, max_30d, latest)]
+        )
+
+    def get_baselines(self) -> dict[str, dict[str, float | None]]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM baselines")
+            return {
+                row["metric_name"]: {
+                    "avg_7d": row["avg_7d"],
+                    "avg_30d": row["avg_30d"],
+                    "std_7d": row["std_7d"],
+                    "std_30d": row["std_30d"],
+                    "min_30d": row["min_30d"],
+                    "max_30d": row["max_30d"],
+                    "latest_value": row["latest_value"],
+                }
+                for row in cursor.fetchall()
+            }
+        finally:
+            conn.close()
+
+    def get_baseline(self, metric: str) -> dict[str, float | None] | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM baselines WHERE metric_name = ?", (metric,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "avg_7d": row["avg_7d"],
+                    "avg_30d": row["avg_30d"],
+                    "std_7d": row["std_7d"],
+                    "std_30d": row["std_30d"],
+                    "latest_value": row["latest_value"],
+                }
+            return None
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Insights
+    # ------------------------------------------------------------------
+    def save_insight(
+        self, rule_name: str, description: str,
+        significance: float | None = None,
+        data: dict | None = None,
+        suppress_hours: int = 168,
+    ) -> int:
+        conn = self._get_conn()
+        # Stored in SQLite's own "YYYY-MM-DD HH:MM:SS" (space-separated, UTC)
+        # format so it compares correctly against datetime('now') in
+        # is_insight_suppressed. Python's default isoformat() uses a 'T'
+        # separator, which sorts AFTER a space — an expires_at written that way
+        # kept insights suppressed until the calendar day rolled over.
+        expires = datetime.utcnow() + timedelta(hours=suppress_hours)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO insights (rule_name, description, significance, data_json, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (rule_name, description, significance, json.dumps(data) if data else None,
+                 expires.isoformat(sep=" ", timespec="seconds")),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_recent_insights(self, hours: int = 168) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        since = datetime.utcnow() - timedelta(hours=hours)
+        try:
+            cursor = conn.cursor()
+            # Space-separated to match discovered_at's datetime('now') format —
+            # a 'T'-separated cutoff string-compares as later than any
+            # same-day space-separated timestamp, silently excluding insights
+            # discovered on the boundary day.
+            cursor.execute(
+                "SELECT * FROM insights WHERE discovered_at >= ? ORDER BY discovered_at DESC",
+                (since.isoformat(sep=" ", timespec="seconds"),),
+            )
+            return [
+                {
+                    "rule_name": r["rule_name"],
+                    "description": r["description"],
+                    "significance": r["significance"],
+                    "discovered_at": r["discovered_at"],
+                }
+                for r in cursor.fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def is_insight_suppressed(self, rule_name: str) -> bool:
+        """Check if an identical insight was recently reported."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            # SQLite 'now' is in UTC if we use default, but let's be consistent
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM insights WHERE rule_name = ? AND expires_at > datetime('now')",
+                (rule_name,),
+            )
+            row = cursor.fetchone()
+            return (row["cnt"] or 0) > 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Scan reports (persisted LLM scan narratives)
+    # ------------------------------------------------------------------
+    def save_scan_report(
+        self,
+        focus: str,
+        report: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scan_reports (focus, report, start_date, end_date, created_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                """,
+                (focus, report, start_date, end_date),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_scan_reports(
+        self, limit: int = 10, focus: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent persisted scan reports, newest first."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            where = "WHERE focus = ?" if focus else ""
+            params: tuple = (focus, max(1, min(limit, 50))) if focus else (max(1, min(limit, 50)),)
+            cursor.execute(
+                f"SELECT id, focus, report, start_date, end_date, created_at "
+                f"FROM scan_reports {where} ORDER BY id DESC LIMIT ?",
+                params,
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "focus": r["focus"],
+                    "report": r["report"],
+                    "start_date": r["start_date"],
+                    "end_date": r["end_date"],
+                    "created_at": r["created_at"],
+                }
+                for r in cursor.fetchall()
+            ]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Experiments (n-of-1 personal behaviour trials)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _experiment_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        """Materialise an experiments row, parsing result_json inline under a
+        `result` key (the raw JSON column is dropped)."""
+        d = {k: row[k] for k in row.keys()}
+        raw = d.pop("result_json", None)
+        if raw:
+            try:
+                d["result"] = json.loads(raw)
+            except (ValueError, TypeError):
+                d["result"] = None
+        return d
+
+    def create_experiment(
+        self,
+        name: str,
+        hypothesis: str,
+        behavior: str,
+        metric: str,
+        expected_direction: str = "increase",
+        lag_days: int = 1,
+        min_days_per_arm: int = 5,
+    ) -> int:
+        """Register a new active experiment. Raises sqlite3.IntegrityError when
+        the name is already taken (the UNIQUE constraint)."""
+        conn = self._get_conn()
+        # started_at written via datetime('now') so it lands in SQLite's own
+        # space-separated UTC format, like every other timestamp here — a
+        # Python isoformat() 'T' separator sorts after a space and would break
+        # range comparisons (see the save_insight note above).
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO experiments
+                    (name, hypothesis, behavior, metric, expected_direction,
+                     lag_days, min_days_per_arm, status, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))
+                """,
+                (name, hypothesis, behavior, metric, expected_direction,
+                 int(lag_days), int(min_days_per_arm)),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_experiments(self, status: str | None = None) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            if status:
+                cursor.execute(
+                    "SELECT * FROM experiments WHERE status = ? "
+                    "ORDER BY started_at DESC, id DESC",
+                    (status,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM experiments ORDER BY started_at DESC, id DESC"
+                )
+            return [self._experiment_row_to_dict(r) for r in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_experiment(self, name: str) -> dict[str, Any] | None:
+        """Exact name match, case-insensitive."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM experiments WHERE name = ? COLLATE NOCASE", (name,)
+            )
+            row = cursor.fetchone()
+            return self._experiment_row_to_dict(row) if row else None
+        finally:
+            conn.close()
+
+    def record_experiment_result(self, name: str, result: dict) -> None:
+        """Store an interim evaluation — updates result_json only."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE experiments SET result_json = ? WHERE name = ? COLLATE NOCASE",
+                (json.dumps(result), name),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def conclude_experiment(self, name: str, verdict: str, result: dict) -> None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE experiments
+                   SET status = 'completed', verdict = ?, result_json = ?,
+                       ended_at = datetime('now')
+                 WHERE name = ? COLLATE NOCASE
+                """,
+                (verdict, json.dumps(result), name),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def abandon_experiment(self, name: str) -> None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE experiments SET status = 'abandoned', "
+                "ended_at = datetime('now') WHERE name = ? COLLATE NOCASE",
+                (name,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Scale readings (local-first — every reading lands immediately, incl.
+    # metrics Garmin has no field for; Garmin's own synced value wins later
+    # once it lands, see cache.py's fallback merge)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_scale_taken_at(taken_at: str) -> str:
+        """Derive the local YYYY-MM-DD calendar day from ``taken_at``.
+
+        Tolerates a bare ``YYYY-MM-DD`` or a full ISO datetime (both parse via
+        ``datetime.fromisoformat``). Raises ValueError on anything else so the
+        API layer can turn it into a 400.
+        """
+        raw = str(taken_at).strip()
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            raise ValueError(f"Unparseable taken_at: {taken_at!r}") from None
+        return dt.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _scale_reading_row_to_dict(row: sqlite3.Row, include_raw: bool = False) -> dict[str, Any]:
+        d = {k: row[k] for k in row.keys()}
+        if not include_raw:
+            d.pop("raw_frames", None)
+        raw_extras = d.pop("extras_json", None)
+        extras: dict[str, Any] = {}
+        if raw_extras:
+            try:
+                extras = json.loads(raw_extras)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Corrupt extras_json for scale_readings id=%s: %s", d.get("id"), e
+                )
+                extras = {}
+        d["extras"] = extras
+        d["uploaded_to_garmin"] = bool(d.get("uploaded_to_garmin"))
+        return d
+
+    def save_scale_reading(
+        self,
+        *,
+        taken_at: str,
+        adapter: str,
+        weight_kg: float,
+        impedance_ohm: float | None = None,
+        bmi: float | None = None,
+        body_fat_pct: float | None = None,
+        body_water_pct: float | None = None,
+        muscle_mass_kg: float | None = None,
+        bone_mass_kg: float | None = None,
+        visceral_fat: float | None = None,
+        metabolic_age: float | None = None,
+        physique_rating: float | None = None,
+        extras: dict[str, Any] | None = None,
+        raw_frames: str | None = None,
+    ) -> int:
+        """Store one scale reading immediately (local-first).
+
+        Upserts on ``taken_at`` so a retried save replaces rather than
+        duplicates; ``uploaded_to_garmin`` is deliberately left out of the
+        conflict SET clause so a retry can never clear a flag already set to 1.
+        Raises ValueError when ``taken_at`` can't be parsed into a date.
+        """
+        taken_at = str(taken_at).strip()
+        date = self._normalize_scale_taken_at(taken_at)
+        extras_json = json.dumps(extras) if extras else None
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scale_readings (
+                    taken_at, date, adapter, weight_kg, impedance_ohm, bmi,
+                    body_fat_pct, body_water_pct, muscle_mass_kg, bone_mass_kg,
+                    visceral_fat, metabolic_age, physique_rating, extras_json,
+                    raw_frames, uploaded_to_garmin
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(taken_at) DO UPDATE SET
+                    date = excluded.date,
+                    adapter = excluded.adapter,
+                    weight_kg = excluded.weight_kg,
+                    impedance_ohm = excluded.impedance_ohm,
+                    bmi = excluded.bmi,
+                    body_fat_pct = excluded.body_fat_pct,
+                    body_water_pct = excluded.body_water_pct,
+                    muscle_mass_kg = excluded.muscle_mass_kg,
+                    bone_mass_kg = excluded.bone_mass_kg,
+                    visceral_fat = excluded.visceral_fat,
+                    metabolic_age = excluded.metabolic_age,
+                    physique_rating = excluded.physique_rating,
+                    extras_json = excluded.extras_json,
+                    raw_frames = excluded.raw_frames
+                """,
+                (
+                    taken_at, date, adapter, float(weight_kg), impedance_ohm, bmi,
+                    body_fat_pct, body_water_pct, muscle_mass_kg, bone_mass_kg,
+                    visceral_fat, metabolic_age, physique_rating, extras_json,
+                    raw_frames,
+                ),
+            )
+            conn.commit()
+            # lastrowid is unreliable on the ON CONFLICT..DO UPDATE branch, so
+            # look the row up explicitly rather than trust it.
+            cursor.execute("SELECT id FROM scale_readings WHERE taken_at = ?", (taken_at,))
+            row = cursor.fetchone()
+            return row["id"]
+        finally:
+            conn.close()
+
+    def get_scale_readings(
+        self, start: str, end: str, include_raw: bool = False
+    ) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM scale_readings WHERE date >= ? AND date <= ? "
+                "ORDER BY taken_at",
+                (start, end),
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [self._scale_reading_row_to_dict(r, include_raw=include_raw) for r in rows]
+
+    def get_latest_scale_reading(self, date: str) -> dict[str, Any] | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM scale_readings WHERE date = ? ORDER BY taken_at DESC LIMIT 1",
+                (date,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        return self._scale_reading_row_to_dict(row) if row else None
+
+    def mark_scale_reading_uploaded(self, reading_id: int) -> None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE scale_readings SET uploaded_to_garmin = 1 WHERE id = ?",
+                (reading_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Sessions
+    # ------------------------------------------------------------------
+    def save_session(
+        self, summary: str, key_findings: list[str] | None = None,
+        messages: list[dict] | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO sessions (summary, key_findings, messages_json, created_at)
+                VALUES (?, ?, ?, datetime('now'))
+                """,
+                (
+                    summary,
+                    json.dumps(key_findings) if key_findings else None,
+                    json.dumps(messages) if messages else None,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_last_session(self) -> dict[str, Any] | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "summary": row["summary"],
+                    "key_findings": json.loads(row["key_findings"]) if row["key_findings"] else [],
+                    "created_at": row["created_at"],
+                }
+            return None
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # User profile
+    # ------------------------------------------------------------------
+    def set_profile(self, key: str, value: Any) -> None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO user_profile (key, value_json, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET 
+                    value_json = excluded.value_json,
+                    updated_at = datetime('now')
+                """,
+                (key, json.dumps(value)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_profile(self, key: str) -> Any | None:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value_json FROM user_profile WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return json.loads(row["value_json"]) if row else None
+        finally:
+            conn.close()
+
+    def get_all_profile(self) -> dict[str, Any]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT key, value_json FROM user_profile")
+            return {row["key"]: json.loads(row["value_json"]) for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Chat memory (lightweight longitudinal context)
+    # ------------------------------------------------------------------
+    def save_chat_memory(
+        self,
+        user_id: str,
+        user_text: str,
+        assistant_text: str | None = None,
+        tags: list[str] | None = None,
+        event_date: str | None = None,
+    ) -> int:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chat_memory (user_id, event_date, tags_json, user_text, assistant_text, created_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                """,
+                (
+                    user_id,
+                    event_date,
+                    json.dumps(tags or []),
+                    user_text,
+                    assistant_text,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_recent_chat_memory(self, user_id: str, limit: int = 25) -> list[dict[str, Any]]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT user_id, event_date, tags_json, user_text, assistant_text, created_at
+                FROM chat_memory
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, max(1, min(limit, 100))),
+            )
+            out: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                out.append({
+                    "user_id": row["user_id"],
+                    "event_date": row["event_date"],
+                    "tags": json.loads(row["tags_json"]) if row["tags_json"] else [],
+                    "user_text": row["user_text"],
+                    "assistant_text": row["assistant_text"],
+                    "created_at": row["created_at"],
+                })
+            return out
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Health check
+    # ------------------------------------------------------------------
+    def health_check(self) -> dict[str, Any]:
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.execute("SELECT COUNT(*) as cnt FROM daily_summaries")
+            summary_count = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM baselines")
+            baseline_count = cursor.fetchone()["cnt"]
+            cursor.execute("SELECT COUNT(*) as cnt FROM insights")
+            insight_count = cursor.fetchone()["cnt"]
+            return {
+                "connected": True,
+                "daily_summaries": summary_count,
+                "baselines": baseline_count,
+                "insights": insight_count,
+            }
+        except Exception as e:
+            return {"connected": False, "error": str(e)}
+        finally:
+            conn.close()
