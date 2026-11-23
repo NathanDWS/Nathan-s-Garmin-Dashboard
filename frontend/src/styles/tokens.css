@@ -15,16 +15,20 @@
   --warn: #d97706;
   --bad: #dc2626;
 
-  --c-run: #ef4444;
-  --c-bike: #f59e0b;
-  --c-swim: #0ea5e9;
-  --c-strength: #8b5cf6;
-  --c-walk: #84cc16;
-  --c-other: #94a3b8;
-  --c-sleep-deep: #3730a3;
-  --c-sleep-light: #818cf8;
-  --c-sleep-rem: #c084fc;
-  --c-sleep-awake: #fda4af;
+  /* Categorical = dataviz reference palette slots 1-5, fixed order (validated). */
+  --c-run: #2a78d6;
+  --c-bike: #eb6834;
+  --c-swim: #1baf7a;
+  --c-strength: #eda100;
+  --c-walk: #e87ba4;
+  --c-other: #9a9ca3;
+  --c-series: #2a78d6;
+  --c-series-2: #eb6834;
+  /* Sleep depth: one indigo ramp, deeper = darker; awake neutral. */
+  --c-sleep-deep: #2e2a8a;
+  --c-sleep-rem: #5b55d6;
+  --c-sleep-light: #a9a6f0;
+  --c-sleep-awake: #d6d6dc;
   --grid: #ececf0;
 }
 
@@ -40,9 +44,18 @@
     --good: #34d399;
     --warn: #fbbf24;
     --bad: #f87171;
-    --c-sleep-deep: #6366f1;
-    --c-sleep-light: #a5b4fc;
-    --c-sleep-rem: #d8b4fe;
+    --c-run: #3987e5;
+    --c-bike: #d95926;
+    --c-swim: #199e70;
+    --c-strength: #c98500;
+    --c-walk: #d55181;
+    --c-other: #6b6f7a;
+    --c-series: #3987e5;
+    --c-series-2: #d95926;
+    --c-sleep-deep: #c9c6ff;
+    --c-sleep-rem: #8a84f0;
+    --c-sleep-light: #4f4aa8;
+    --c-sleep-awake: #3a3f4c;
     --grid: #1c212b;
   }
 }
