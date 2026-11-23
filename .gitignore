@@ -1,0 +1,10 @@
+data/
+.env
+.venv/
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.superpowers/
+*.egg-info/
